@@ -9924,14 +9924,6 @@ static void set_cpus_allowed_fair(struct task_struct *p, struct affinity_context
 	set_task_max_allowed_capacity(p);
 }
 
-static int
-balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
-{
-	if (rq->nr_running)
-		return 1;
-
-	return newidle_balance(rq, rf) != 0;
-}
 #else
 static inline void set_task_max_allowed_capacity(struct task_struct *p) {}
 #endif /* CONFIG_SMP */
@@ -10162,17 +10154,18 @@ preempt:
 	resched_curr_lazy(rq);
 }
 
-static struct task_struct *pick_task_fair(struct rq *rq)
+static struct task_struct *pick_task_fair(struct rq *rq, struct rq_flags *rf)
 {
 	struct sched_entity *se;
 	struct cfs_rq *cfs_rq;
 	struct task_struct *p;
 	bool throttled;
+	int new_tasks;
 
 again:
 	cfs_rq = &rq->cfs;
 	if (!cfs_rq->nr_queued)
-		return NULL;
+		goto idle;
 
 	throttled = false;
 
@@ -10193,6 +10186,37 @@ again:
 	if (unlikely(throttled))
 		task_throttle_setup_work(p);
 	return p;
+
+idle:
+	time = schedstat_start_time();
+		/*
+		 * We must set idle_stamp _before_ calling try_steal() or
+		 * sched_balance_newidle(), such that we measure the duration
+		 * as idle time.
+		 */
+		rq_idle_stamp_update(rq);
+
+		new_tasks = newidle_balance(rq, rf);
+		if (new_tasks == 0)
+			new_tasks = try_steal(rq, rf);
+
+		if (new_tasks)
+			rq_idle_stamp_clear(rq);
+
+		schedstat_end_time(rq->find_time, time);
+
+		/*
+		 * Because try_steal() and sched_balance_newidle() release
+		 * (and re-acquire) rq->lock, it is possible for any higher priority
+		 * task to appear. In that case we must re-start the
+		 * pick_next_entity() loop.
+		 */
+		if (new_tasks < 0)
+			return RETRY_TASK;
+
+		if (new_tasks > 0)
+			goto again;
+	return NULL;
 }
 
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
@@ -10203,13 +10227,13 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 {
 	struct sched_entity *se;
 	struct task_struct *p;
-	int new_tasks;
 	unsigned long time;
 
-again:
-	p = pick_task_fair(rq);
+	p = pick_task_fair(rq, rf);
+	if (unlikely(p == RETRY_TASK))
+		return p;
 	if (!p)
-		goto idle;
+		return p;
 	se = &p->se;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -10267,50 +10291,12 @@ simple:
 	if (prev->on_rq)
 		util_est_update_running(&rq->cfs, prev);
 	return p;
-
-idle:
-	if (rf) {
-		time = schedstat_start_time();
-		/*
-		 * We must set idle_stamp _before_ calling try_steal() or
-		 * sched_balance_newidle(), such that we measure the duration
-		 * as idle time.
-		 */
-		rq_idle_stamp_update(rq);
-
-		new_tasks = newidle_balance(rq, rf);
-		if (new_tasks == 0)
-			new_tasks = try_steal(rq, rf);
-
-		if (new_tasks)
-			rq_idle_stamp_clear(rq);
-
-		schedstat_end_time(rq->find_time, time);
-
-		/*
-		 * Because try_steal() and sched_balance_newidle() release
-		 * (and re-acquire) rq->lock, it is possible for any higher priority
-		 * task to appear. In that case we must re-start the
-		 * pick_next_entity() loop.
-		 */
-		if (new_tasks < 0)
-			return RETRY_TASK;
-
-		if (new_tasks > 0)
-			goto again;
-	}
-
-	return NULL;
 }
 
-static struct task_struct *__pick_next_task_fair(struct rq *rq, struct task_struct *prev)
+static struct task_struct *
+fair_server_pick_task(struct sched_dl_entity *dl_se, struct rq_flags *rf)
 {
-	return pick_next_task_fair(rq, prev, NULL);
-}
-
-static struct task_struct *fair_server_pick_task(struct sched_dl_entity *dl_se)
-{
-	return pick_task_fair(dl_se->rq);
+	return pick_task_fair(dl_se->rq, rf);
 }
 
 void fair_server_init(struct rq *rq)
@@ -15487,12 +15473,11 @@ DEFINE_SCHED_CLASS(fair) = {
 	.wakeup_preempt		= wakeup_preempt_fair,
 
 	.pick_task		= pick_task_fair,
-	.pick_next_task		= __pick_next_task_fair,
+	.pick_next_task		= pick_next_task_fair,
 	.put_prev_task		= put_prev_task_fair,
 	.set_next_task          = set_next_task_fair,
 
 #ifdef CONFIG_SMP
-	.balance		= balance_fair,
 	.select_task_rq		= select_task_rq_fair,
 	.migrate_task_rq	= migrate_task_rq_fair,
 
