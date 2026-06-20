@@ -1206,6 +1206,7 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
  */
 static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	u64 vruntime = min_vruntime(se->vruntime, avg_vruntime(cfs_rq));
 	u64 slice = normalized_sysctl_sched_base_slice;
 	u64 vprot = se->deadline;
 
@@ -1213,8 +1214,11 @@ static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity 
 		slice = cfs_rq_min_slice(cfs_rq);
 
 	slice = min(slice, se->slice);
-	if (slice != se->slice)
-		vprot = min_vruntime(vprot, se->vruntime + calc_delta_fair(slice, se));
+
+	if (sched_feat(PREEMPT_SHORT) && slice < se->slice)
+		vprot = avg_vruntime(cfs_rq);
+	else if ((vruntime != se->vruntime) || (slice != se->slice))
+		vprot = min_vruntime(vprot, vruntime + calc_delta_fair(slice, se));
 
 	se->vprot = vprot;
 }
@@ -1222,8 +1226,9 @@ static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity 
 static inline void update_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	u64 slice = cfs_rq_min_slice(cfs_rq);
+	u64 vruntime = min_vruntime(se->vruntime, avg_vruntime(cfs_rq));
 
-	se->vprot = min_vruntime(se->vprot, se->vruntime + calc_delta_fair(slice, se));
+	se->vprot = min_vruntime(se->vprot, vruntime + calc_delta_fair(slice, se));
 }
 
 static inline bool protect_slice(struct sched_entity *se)
@@ -10048,7 +10053,7 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	 * prevents us from potentially nominating it as a false LAST_BUDDY
 	 * below.
 	 */
-	if (test_tsk_need_resched(rq->curr))
+	if (!sched_feat(PREEMPT_SHORT) && test_tsk_need_resched(rq->curr))
 		return;
 
 	if (!sched_feat(WAKEUP_PREEMPTION))
@@ -10060,27 +10065,22 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	cse_is_idle = se_is_idle(se);
 	pse_is_idle = se_is_idle(pse);
 
+	nse = se;
 	/*
 	 * Preempt an idle entity in favor of a non-idle entity (and don't preempt
 	 * in the inverse case).
 	 */
-	if (cse_is_idle && !pse_is_idle) {
-		/*
-		 * When non-idle entity preempt an idle entity,
-		 * don't give idle entity slice protection.
-		 */
-		preempt_action = PREEMPT_WAKEUP_SHORT;
+	if (cse_is_idle && !pse_is_idle)
 		goto preempt;
-	}
 
 	if (cse_is_idle != pse_is_idle)
-		return;
+		goto update;
 
 	/*
 	 * BATCH and IDLE tasks do not preempt others.
 	 */
 	if (unlikely(p->policy != SCHED_NORMAL))
-		return;
+		goto update;
 
 	cfs_rq = cfs_rq_of(se);
 	update_curr(cfs_rq);
@@ -10101,7 +10101,7 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	 * EEVDF to forcibly queue an ineligible task.
 	 */
 	if ((wake_flags & WF_FORK) || pse->sched_delayed)
-		return;
+		goto update;
 
 	/* Prefer picking wakee soon if appropriate. */
 	if (sched_feat(NEXT_BUDDY) &&
@@ -10140,16 +10140,23 @@ pick:
 	if (!nse && cfs_rq->nr_queued)
 		goto pick;
 
+	/*
+	 * If @p is eligible but not the next task to run then cancel protection
+	 * to prevent large scheduling latency
+	 */
+	if (preempt_action == PREEMPT_WAKEUP_SHORT && entity_eligible(cfs_rq, pse))
+		goto preempt;
+update:
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
 
 	return;
 
 preempt:
-	if (preempt_action == PREEMPT_WAKEUP_SHORT) {
-		cancel_protect_slice(se);
-		clear_buddies(cfs_rq, se);
-	}
+	cancel_protect_slice(se);
+
+	if (preempt_action == PREEMPT_WAKEUP_SHORT && nse == pse)
+		set_next_buddy(&p->se);
 
 	resched_curr_lazy(rq);
 }
@@ -10189,6 +10196,9 @@ again:
 	return p;
 
 idle:
+	if (!rf)
+		return NULL;
+
 	time = schedstat_start_time();
 		/*
 		 * We must set idle_stamp _before_ calling try_steal() or
@@ -10223,7 +10233,7 @@ idle:
 static struct task_struct *
 fair_server_pick_task(struct sched_dl_entity *dl_se, struct rq_flags *rf)
 {
-	return pick_task_fair(dl_se->rq, rf);
+	return pick_task_fair(dl_se->rq, NULL);
 }
 
 void fair_server_init(struct rq *rq)
