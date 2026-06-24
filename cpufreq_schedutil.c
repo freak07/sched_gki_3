@@ -261,6 +261,18 @@ static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util,  int c
 {
 	struct rq *rq = cpu_rq(cpu);
 	u64 delay;
+	int swipe_state = sched_get_current_swipe();
+
+	if (unlikely(sched_get_display_idle())) {
+		return util;
+	}
+
+	if (unlikely(swipe_state != SWIPE_NONE)) {
+		if (swipe_state == SWIPE_STRONG)
+			return util + (util >> 1);
+
+		return util + (util >> 2) + (util >> 3);
+	}
 
 	if (sched_feat(CONST_DVFS_HEADROOM))
 		return util + (util >> 2);
@@ -300,6 +312,10 @@ extern unsigned int sysctl_sched_game_mode;
 static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
 {
 	unsigned long min, max, util = cpu_util_cfs(sg_cpu->cpu);
+
+	if (unlikely(sched_get_display_idle())) {
+        util = (util * 85) / 100;
+    }
 
 	if (unlikely(sysctl_sched_game_mode)) {
         util = (util * 70) / 100;

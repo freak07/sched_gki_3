@@ -9757,6 +9757,27 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	 * called for any other case such as wake up or push callback.
 	 */
 	if (!is_rd_overutilized(this_rq()->rd) && want_sibling) {
+
+		/* Screen-Off EAS Bypass & Aggressive Packing
+		 * If the screen is off and the task is light, skip EAS math entirely.
+		 * Pack onto the previous core if it's in the efficient cluster (0-4),
+		 * otherwise find the first available efficient core (0-4).
+		 */
+		if (unlikely(sched_get_display_idle()) && task_util_est(p) < 300) {
+			/* Stay on prev_cpu if it's an efficient core and not heavily overloaded */
+			if (prev_cpu >= 0 && prev_cpu <= 4 && cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
+				if (cpu_rq(prev_cpu)->cfs.h_nr_queued <= 2)
+					return prev_cpu;
+			}
+
+			int i;
+			/* Search generally across all 5 efficient cores (0-4) */
+			for (i = 0; i <= 4; i++) {
+				if (available_idle_cpu(i) && cpumask_test_cpu(i, p->cpus_ptr))
+					return i;
+			}
+		}
+
 		new_cpu = find_energy_efficient_cpu(p, prev_cpu, sync);
 		if (new_cpu >= 0)
 			return new_cpu;
@@ -14252,6 +14273,9 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	 * Do not pull tasks towards !active CPUs...
 	 */
 	if (!cpu_active(this_cpu))
+		return 0;
+
+	if (unlikely(sched_get_display_idle()) && this_cpu <= 4)
 		return 0;
 
 	/*
