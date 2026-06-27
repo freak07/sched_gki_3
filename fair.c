@@ -934,6 +934,48 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
 	return cfs_rq->zero_vruntime;
 }
 
+/*
+ * Compute the vruntime until which the entity remains eligible when it runs
+ * or is about to run on the CPU. We use this value to set vprot to the min
+ * value until which other entities would not be picked anyway.
+ *     \Sum (v_i - v0)*w_i
+ * V = ------------------- + v0
+ *          \Sum w_i
+ *
+ * We want V' for (v_se - v0) == 0. Previous entity has already been enqueued
+ * in the rb tree and next is already dequeued so
+ *
+ *      cfs_rq->sum_w_vruntime
+ * V' = ------------------------- + v0
+ *      cfs_rq->sum_weight + w_se
+
+ */
+static u64 eligible_vruntime(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct sched_entity __maybe_unused *curr = cfs_rq->curr;
+	long weight = cfs_rq->sum_weight;
+	s64 delta = 0;
+
+	if (weight) {
+		s64 runtime = cfs_rq->sum_w_vruntime;
+
+		weight += avg_vruntime_weight(cfs_rq, se->load.weight);
+
+		/* sign flips effective floor / ceiling */
+		if (runtime < 0)
+			runtime -= (weight - 1);
+
+		delta = div64_long(runtime, weight);
+	} else {
+		/*
+		 * When there is but one element, it is the average.
+		 */
+		delta = 0;
+	}
+
+	return cfs_rq->zero_vruntime + delta + 1;
+}
+
 static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
 
 /*
@@ -1206,7 +1248,6 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
  */
 static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	u64 vruntime = min_vruntime(se->vruntime, avg_vruntime(cfs_rq));
 	u64 slice = normalized_sysctl_sched_base_slice;
 	u64 vprot = se->deadline;
 
@@ -1215,10 +1256,13 @@ static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity 
 
 	slice = min(slice, se->slice);
 
-	if (sched_feat(PREEMPT_SHORT) && slice < se->slice)
-		vprot = avg_vruntime(cfs_rq);
-	else if ((vruntime != se->vruntime) || (slice != se->slice))
-		vprot = min_vruntime(vprot, vruntime + calc_delta_fair(slice, se));
+	/* If there are shorter slices than se's one */
+	if (slice != se->slice) {
+		if (sched_feat(PREEMPT_SHORT))
+			vprot = min_vruntime(vprot, eligible_vruntime(cfs_rq, se));
+		else
+			vprot = min_vruntime(vprot, se->vruntime + calc_delta_fair(slice, se));
+	}
 
 	se->vprot = vprot;
 }
@@ -10094,6 +10138,9 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	if (cse_is_idle && !pse_is_idle)
 		goto preempt;
 
+	cfs_rq = cfs_rq_of(se);
+	update_curr(cfs_rq);
+
 	if (cse_is_idle != pse_is_idle)
 		goto update;
 
@@ -10103,8 +10150,6 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	if (unlikely(p->policy != SCHED_NORMAL))
 		goto update;
 
-	cfs_rq = cfs_rq_of(se);
-	update_curr(cfs_rq);
 
 	/*
 	 * If @p has a shorter slice than current and @p is eligible, override
